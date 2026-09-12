@@ -32,8 +32,11 @@ DATASETS = {
     "atlas/countries-50m.json": "topology",
     "atlas/countries-10m.json": "topology",
     "atlas/marine-areas.json": "topology",
+    "atlas/continents.json": "lookup",
     "sky/stars.json": "sky",
 }
+
+CONTINENTS = {"Africa", "Antarctica", "Asia", "Europe", "North America", "Oceania", "South America"}
 
 problems = []
 
@@ -77,7 +80,16 @@ def check_sky(name, data):
             break
 
 
-SHAPES = {"topology": check_topology, "sky": check_sky}
+def check_lookup(name, data):
+    if not isinstance(data, dict) or not data:
+        fail(name, "not a non-empty object")
+        return
+    bad = [k for k, v in data.items() if not isinstance(v, str)]
+    if bad:
+        fail(name, f"{len(bad)} entries are not strings: {bad[:3]}")
+
+
+SHAPES = {"topology": check_topology, "sky": check_sky, "lookup": check_lookup}
 
 
 # ---------- invariants ----------
@@ -94,6 +106,21 @@ def invariants(files):
                 fail(name, f"{expected} is missing — the atlas or its property names changed")
         if len(names) < 200:
             fail(name, f"only {len(names)} countries")
+
+    # continents.json exists to be joined to the atlas by country name, so the only thing
+    # worth checking is that the join is total: a name the atlas draws but this file has no
+    # entry for is a country the travel map cannot group, and it fails silently at runtime.
+    continents = files.get("atlas/continents.json")
+    if continents and countries:
+        drawn = {g.get("properties", {}).get("name")
+                 for g in countries["objects"]["countries"]["geometries"]}
+        missing = sorted(n for n in drawn if n and n not in continents)
+        if missing:
+            fail("atlas/continents.json", f"{len(missing)} countries in the atlas have no"
+                 f" continent — rebuild it: {missing[:4]}")
+        odd = sorted(set(continents.values()) - CONTINENTS)
+        if odd:
+            fail("atlas/continents.json", f"unexpected continent names: {odd}")
 
     marine = files.get("atlas/marine-areas.json")
     if marine:

@@ -19,6 +19,7 @@ https://cdn.jsdelivr.net/gh/Zhang-En-Yao/assets.core@<tag>/atlas/countries-50m.j
 | `atlas/countries-50m.json` | [world-atlas](https://github.com/topojson/world-atlas) (Natural Earth 1:50m) | first paint, every page |
 | `atlas/countries-10m.json` | [Natural Earth 1:10m](https://github.com/nvkelso/natural-earth-vector) | fetched only when the map is zoomed in |
 | `atlas/marine-areas.json` | Natural Earth 1:10m | `areas` = named seas, gulfs, straits; `borders` = maritime boundary indicators |
+| `atlas/continents.json` | Natural Earth 1:50m | country name → continent, the key the travel map groups by |
 | `sky/stars.json` | [AT-HYG v4.0](https://codeberg.org/astronexus/athyg) + [d3-celestial](https://github.com/ofrohn/d3-celestial) | stars to magnitude 6, and the IAU constellation figures |
 
 `MANIFEST.json` records what each build produced. It is what the drift check compares
@@ -30,8 +31,9 @@ Each script fetches from upstream and writes into this repository. They are slow
 catalogue is a 14 MB download; the atlas is 25 MB of GeoJSON) and they need the network.
 
 ```
-python3 build/build-atlas.py     # countries-10m, marine-areas  — needs node, for the TopoJSON tools
-python3 build/build-stars.py     # stars.json
+python3 build/build-atlas.py       # countries-10m, marine-areas  — needs node, for the TopoJSON tools
+python3 build/build-continents.py  # continents.json, joined to the atlas by country name
+python3 build/build-stars.py       # stars.json
 python3 build/validate.py        # check everything, then update MANIFEST.json
 ```
 

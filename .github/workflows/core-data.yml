@@ -36,7 +36,9 @@ jobs:
 
       - name: Atlas
         if: github.event_name == 'schedule' || inputs.atlas
-        run: python3 build/build-atlas.py
+        run: |
+          python3 build/build-atlas.py
+          python3 build/build-continents.py
 
       - name: Sky
         if: github.event_name == 'schedule' || inputs.sky
