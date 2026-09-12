@@ -1,0 +1,21 @@
+{
+  "built": "2026-09-12T17:20:10+00:00",
+  "datasets": {
+    "atlas/countries-50m.json": {
+      "rows": 242,
+      "bytes": 756420
+    },
+    "atlas/countries-10m.json": {
+      "rows": 258,
+      "bytes": 2067581
+    },
+    "atlas/marine-areas.json": {
+      "rows": 491,
+      "bytes": 577542
+    },
+    "sky/stars.json": {
+      "rows": 5071,
+      "bytes": 112563
+    }
+  }
+}
