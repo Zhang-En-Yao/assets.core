@@ -1,0 +1,96 @@
+name: Trip data
+
+# Called by every assets.trip.* repository, so the build scripts exist once, here.
+#
+#   # assets.trip.<id>/.github/workflows/data.yml
+#   name: Data
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         places: { type: boolean, default: true }
+#         streets: { type: boolean, default: false }
+#   jobs:
+#     build:
+#       uses: Zhang-En-Yao/assets.core/.github/workflows/trip-data.yml@main
+#       secrets: inherit
+#       with:
+#         places: ${{ inputs.places }}
+#         streets: ${{ inputs.streets }}
+
+on:
+  workflow_call:
+    inputs:
+      places:
+        description: Refresh places.json from Wikidata
+        type: boolean
+        default: true
+      streets:
+        description: Fetch any streets.json maps that are missing
+        type: boolean
+        default: false
+      tag:
+        description: Tag to publish as; the date if left blank
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the trip
+        uses: actions/checkout@v4
+
+      - name: Check out the build scripts
+        uses: actions/checkout@v4
+        with:
+          repository: Zhang-En-Yao/assets.core
+          path: .core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Places
+        if: inputs.places
+        run: python3 .core/build/build-places.py
+
+      # Overpass is a shared public instance; this only asks for maps that are not
+      # already in streets.json, and fails the run if any query fails, so a half-fetched
+      # file is never published as if it were whole.
+      - name: Streets
+        if: inputs.streets
+        run: python3 .core/build/build-streets.py
+
+      - name: Validate
+        run: python3 .core/build/validate-trip.py
+
+      - name: Commit and tag
+        run: |
+          rm -rf .core
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "nothing changed" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="$(date -u +%Y-%m-%d)"
+          git add -A
+          git commit -m "Rebuild trip data ($tag)"
+          git tag -f "$tag"
+          git push origin HEAD --follow-tags --force-with-lease
+          {
+            echo "### Published \`$tag\`"
+            echo
+            echo "Point the site's travel/index.json at it:"
+            echo '```json'
+            echo "\"assets\": \"${{ github.repository }}@$tag\""
+            echo '```'
+            echo
+            echo '```json'
+            cat MANIFEST.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

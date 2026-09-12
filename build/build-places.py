@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """Regenerate a trip's places.json — the Wikidata record behind each of its points.
 
-Run from a trip repository: content.json in, places.json out. Each point's `wikidata` key
-is the join, and this script only follows it. Everything written is in Wikidata's own
-English labels; nothing is translated, reworded or interpreted.
+Run from a trip repository: content.json in, places.json out.
 
-A point with no `wikidata` key is matched by name crossed with proximity to the
-coordinate on file, and the result is printed for you to check — but only `--link` writes
-it back into content.json, because which entity a place *is* is an editorial decision and
-belongs in the file you edit, not in a table inside a build script. A point that genuinely
-has no Wikidata item (a cafe, an ice cream counter) is given `"wikidata": null`, which
-stops the matcher asking about it again.
+This script does not guess. Each point's `wikidata` key is the join, and all this does is
+follow it: no name matching, no proximity scoring, no writing back to content.json. Which
+entity a place *is* is an editorial decision, and it is recorded where you can see and
+change it, in the file you edit. Three states, all of them explicit:
 
-Coordinates are never written back. content.json keeps the ones you typed, places.json
-carries Wikidata's, and the page decides which to draw.
+    "wikidata": "Q705949"   linked — this is the entity
+    "wikidata": null        checked — no Wikidata item exists for this place
+    key absent              not looked at yet
 
-    python3 ../assets.core/build/build-places.py           # fetch for the linked points
-    python3 ../assets.core/build/build-places.py --link    # also resolve and save new QIDs
+Everything written is in Wikidata's own English labels; nothing is translated, reworded
+or interpreted. Coordinates are never written back either: content.json keeps the ones
+you typed, places.json carries Wikidata's, and validate-trip.py reports where the two
+disagree so you can decide.
+
+    python3 ../assets.core/build/build-places.py
 """
 
 import argparse
 import json
-import math
 import pathlib
 import re
 import sys
@@ -33,13 +33,10 @@ REPO = pathlib.Path.cwd()
 CONTENT = REPO / "content.json"
 OUT = REPO / "places.json"
 
-API = "https://www.wikidata.org/w/api.php"
 SPARQL = "https://query.wikidata.org/sparql"
 AGENT = "zhang-en-yao.github.io places builder (build-places.py)"
 GAP_S = 0.15
 
-MAG_NAME_MIN = 0.55  # name similarity a search hit needs before it is accepted
-MAX_M = 1200         # …and how far it may sit from the coordinate already on file
 # Claims the fact card shows. Everything Wikidata has is written out; how many of them a
 # card prints is the page's business, not this script's.
 CLAIMS = [
@@ -65,80 +62,6 @@ def get(url):
 def sparql(query):
     time.sleep(GAP_S)
     return get(f"{SPARQL}?format=json&query={urllib.parse.quote(query)}")["results"]["bindings"]
-
-
-def search(name):
-    time.sleep(GAP_S)
-    url = (f"{API}?action=wbsearchentities&format=json&language=en&uselang=en&type=item"
-           f"&limit=12&search={urllib.parse.quote(name)}")
-    return [(h["id"], h.get("label", ""), h.get("aliases") or []) for h in get(url).get("search", [])]
-
-
-def haversine(lat1, lon1, lat2, lon2):
-    r, d = 6371000.0, math.pi / 180
-    a = (math.sin((lat2 - lat1) * d / 2) ** 2
-         + math.cos(lat1 * d) * math.cos(lat2 * d) * math.sin((lon2 - lon1) * d / 2) ** 2)
-    return 2 * r * math.asin(math.sqrt(a))
-
-
-def similarity(a, b):
-    norm = lambda s: re.sub(r"[^a-z0-9　-鿿]+", " ", s.lower()).strip()
-    a, b = norm(a), norm(b)
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    x, y = set(a.split()), set(b.split())
-    jaccard = len(x & y) / len(x | y)
-    return max(jaccard, 0.75 if a in b or b in a else 0.0)
-
-
-def variants(name):
-    out = [name]
-    paren = re.match(r"^(.*?)\s*\((.*?)\)\s*$", name)
-    if paren:
-        out += [paren.group(1), paren.group(2)]
-    out += re.split(r"\s*[/,]\s*", name)
-    return [v.strip() for v in dict.fromkeys(out) if len(v.strip()) > 2]
-
-
-def coords_of(qids):
-    out = {}
-    for i in range(0, len(qids), 200):
-        values = " ".join("wd:" + q for q in qids[i:i + 200])
-        rows = sparql(f"SELECT ?item ?c WHERE {{ VALUES ?item {{ {values} }} ?item wdt:P625 ?c . }}")
-        for row in rows:
-            m = re.search(r"Point\(([-\d.]+) ([-\d.]+)\)", row["c"]["value"])
-            if m:
-                out[row["item"]["value"].rsplit("/", 1)[-1]] = (float(m.group(2)), float(m.group(1)))
-    return out
-
-
-def resolve(point):
-    """The best Wikidata item for a point, or None."""
-    hits = []
-    for name in variants(point["name"]):
-        hits += search(name)
-        if hits and name == point["name"]:
-            break
-    hits = list({h[0]: h for h in hits}.values())
-    if not hits:
-        return None
-    coords = coords_of([h[0] for h in hits])
-    best, best_score = None, 0.0
-    for qid, label, aliases in hits:
-        xy = coords.get(qid)
-        if not xy:
-            continue
-        distance = haversine(point["lat"], point["lon"], *xy)
-        name_score = max([similarity(v, label) for v in variants(point["name"])]
-                         + [similarity(point["name"], a) for a in aliases])
-        if name_score < MAG_NAME_MIN or distance > MAX_M:
-            continue
-        score = name_score * 0.7 + math.exp(-distance / 250) * 0.3
-        if score > best_score:
-            best, best_score = qid, score
-    return best
 
 
 def pull(qids, prop):
@@ -189,28 +112,17 @@ def load_points(content):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--link", action="store_true",
-                        help="resolve points that have no wikidata key, and save what is found")
-    args = parser.parse_args()
-
+    argparse.ArgumentParser(description=__doc__).parse_args()
     if not CONTENT.exists():
         raise SystemExit(f"no {CONTENT.name} here — run this from a trip repository")
-    raw = CONTENT.read_text()
-    content = json.loads(raw)
+    content = json.loads(CONTENT.read_text())
     points = load_points(content)
-    unlinked = [(p, w) for p, w in points if "wikidata" not in p]
-    print(f"{len(points)} points, {len(points) - len(unlinked)} linked, {len(unlinked)} unlinked")
-
-    if unlinked and args.link:
-        for point, where in unlinked:
-            point["wikidata"] = resolve(point)
-            print(f"  {where} / {point['name']}: {point['wikidata'] or 'no match — recorded as null'}")
-        CONTENT.write_text(json.dumps(content, ensure_ascii=False, indent=2) + "\n")
-        print(f"{CONTENT.name} updated — check the matches before committing")
-    elif unlinked:
-        for point, where in unlinked:
-            print(f"  unlinked: {where} / {point['name']}  (run with --link to resolve)")
+    unchecked = [(p, w) for p, w in points if "wikidata" not in p]
+    none = [(p, w) for p, w in points if p.get("wikidata", "") is None]
+    print(f"{len(points)} points: {len(points) - len(unchecked) - len(none)} linked, "
+          f"{len(none)} with no Wikidata item, {len(unchecked)} not looked at yet")
+    for point, where in unchecked:
+        print(f"  no wikidata key: {where} / {point['name']}")
 
     qids = sorted({p["wikidata"] for p, _ in points if p.get("wikidata")})
     if not qids:
@@ -286,20 +198,6 @@ def main():
                               ensure_ascii=False, separators=(",", ":")) + "\n")
     print(f"{OUT.name}: {len(places)} entities, {len(sites)} World Heritage sites, "
           f"{OUT.stat().st_size / 1024:.0f} KB")
-
-    # How far Wikidata's coordinate sits from the one in content.json. Nothing is moved —
-    # this is the list to read before trusting a point on the map.
-    drift = []
-    for point, where in points:
-        place = places.get(point.get("wikidata"))
-        if place and "coord" in place and "lat" in point:
-            metres = haversine(point["lat"], point["lon"], *place["coord"])
-            if metres > 150:
-                drift.append((round(metres), where, point["name"]))
-    if drift:
-        print(f"\n{len(drift)} points more than 150 m from Wikidata's coordinate:")
-        for metres, where, name in sorted(drift, reverse=True):
-            print(f"  {metres:6d} m  {where} / {name}")
 
 
 if __name__ == "__main__":
