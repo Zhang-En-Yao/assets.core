@@ -1,0 +1,74 @@
+name: Rebuild core data
+
+# Natural Earth publishes a new release every few years and AT-HYG a few times a year, so
+# this runs on request and once a quarter as a safety net. It never pushes to the site:
+# it tags this repository, and the site's pin is moved by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      atlas:
+        description: Rebuild the atlas (countries and marine areas)
+        type: boolean
+        default: true
+      sky:
+        description: Rebuild the star charts
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 4 1 1,4,7,10 *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Atlas
+        if: github.event_name == 'schedule' || inputs.atlas
+        run: python3 build/build-atlas.py
+
+      - name: Sky
+        if: github.event_name == 'schedule' || inputs.sky
+        run: python3 build/build-stars.py
+
+      # Shape, invariants and drift. A dataset that lost rows fails here, before anything
+      # is committed, because an upstream outage looks like an empty result, not an error.
+      - name: Validate
+        run: python3 build/validate.py
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "nothing changed"
+            exit 0
+          fi
+          tag="$(date -u +%Y-%m-%d)"
+          git add -A
+          git commit -m "Rebuild core data ($tag)"
+          git tag -f "$tag"
+          git push origin HEAD --follow-tags --force-with-lease
+          {
+            echo "### Published \`$tag\`"
+            echo
+            echo "Point the site at it:"
+            echo '```js'
+            echo "export const CORE = 'https://cdn.jsdelivr.net/gh/${{ github.repository }}@$tag';"
+            echo '```'
+            echo
+            echo '```json'
+            cat MANIFEST.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
