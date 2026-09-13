@@ -38,6 +38,10 @@ SPARQL = "https://query.wikidata.org/sparql"
 AGENT = "zhang-en-yao.github.io places builder (build-places.py)"
 GAP_S = 2.0
 BATCH_SIZE = 30
+# Waiting out one Retry-After should be enough for a short burst. If the very next request
+# gets 429 again, this is a longer block that a fixed wait-and-retry won't fix — fail fast
+# instead of silently grinding through 8 attempts (which could take hours).
+MAX_RATE_LIMIT_RETRIES = 2
 
 # Claims the fact card shows. Everything Wikidata has is written out; how many of them a
 # card prints is the page's business, not this script's.
@@ -71,14 +75,23 @@ def countdown_sleep(seconds, label):
 
 def get(url):
     request = urllib.request.Request(url, headers={"User-Agent": AGENT, "Accept": "application/json"})
+    rate_limit_hits = 0
     for attempt in range(8):
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 return json.load(response)
         except urllib.error.HTTPError as error:
-            if error.code != 429 or attempt == 7:
+            if error.code != 429:
                 raise
             wait = max(90, int(error.headers.get("Retry-After", 0)))
+            rate_limit_hits += 1
+            if rate_limit_hits > MAX_RATE_LIMIT_RETRIES:
+                raise SystemExit(
+                    f"still 429 after waiting {format_duration(wait)} and retrying "
+                    f"{MAX_RATE_LIMIT_RETRIES} time(s) — Wikidata has this IP under a longer "
+                    "block, not a short burst limit. Waiting the same amount again won't help; "
+                    "try again later."
+                )
             countdown_sleep(wait, "429 — locked out")
         except OSError as error:
             if attempt == 7:
