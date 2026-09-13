@@ -26,6 +26,7 @@ import pathlib
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -48,12 +49,18 @@ DATES = [("inception", "P571"), ("opened", "P1619"), ("ended", "P576")]
 
 def get(url):
     request = urllib.request.Request(url, headers={"User-Agent": AGENT, "Accept": "application/json"})
-    for attempt in range(4):
+    for attempt in range(8):
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 return json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code != 429 or attempt == 7:
+                raise
+            wait = max(65, int(error.headers.get("Retry-After", 0)))
+            print(f"  rate-limited, waiting {wait}s", file=sys.stderr)
+            time.sleep(wait)
         except OSError as error:
-            if attempt == 3:
+            if attempt == 7:
                 raise
             print(f"  retrying ({error})", file=sys.stderr)
             time.sleep(2 * (attempt + 1))
