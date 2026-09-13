@@ -14,6 +14,7 @@ already in streets.json are skipped, so a re-run only fetches what is new.
 """
 
 import argparse
+import email.utils
 import json
 import math
 import pathlib
@@ -21,6 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 # Run from a trip repository: content.json in, streets.json out, both in the working
 # directory. The script itself lives in assets.core so every trip shares one copy.
@@ -118,6 +120,31 @@ def cluster_points(points, cap_m):
     return [groups[r] for r in order]
 
 
+def format_duration(seconds):
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def parse_retry_after(value):
+    """Retry-After is either a number of seconds or an HTTP-date (RFC 7231)."""
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    try:
+        dt = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0, (dt - datetime.now(timezone.utc)).total_seconds())
+
+
 def fetch_streets(bounds, highway_types):
     query = (
         "[out:json][timeout:25];"
@@ -129,24 +156,39 @@ def fetch_streets(bounds, highway_types):
     headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "curl/8.4.0"}
 
     # Two tries per instance (504s and 429s are usually transient), then the next instance.
+    attempts = [(url, attempt) for url in OVERPASS_URLS for attempt in range(2)]
     last_err = None
-    for url in OVERPASS_URLS:
-        for attempt in range(2):
-            if attempt:
-                time.sleep(REQUEST_GAP_S * (attempt + 1))
-            try:
-                req = urllib.request.Request(url, data=data, method="POST", headers=headers)
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    result = json.load(r)
-                ways = [e for e in result.get("elements", []) if e.get("type") == "way" and e.get("geometry")]
-                # Coordinates only, rounded to ~1 m.
-                return [
-                    [[round(n["lon"], 5), round(n["lat"], 5)] for n in w["geometry"]]
-                    for w in ways
-                ]
-            except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-                # OSError covers dropped connections, which aren't URLErrors.
-                last_err = e
+    for i, (url, attempt) in enumerate(attempts):
+        try:
+            req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+            with urllib.request.urlopen(req, timeout=60) as r:
+                result = json.load(r)
+            ways = [e for e in result.get("elements", []) if e.get("type") == "way" and e.get("geometry")]
+            # Coordinates only, rounded to ~1 m.
+            return [
+                [[round(n["lon"], 5), round(n["lat"], 5)] for n in w["geometry"]]
+                for w in ways
+            ]
+        except urllib.error.HTTPError as e:
+            last_err = e
+            wait = REQUEST_GAP_S * (attempt + 2)
+            if e.code == 429:
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                locked_for = parse_retry_after(retry_after) if retry_after else None
+                if locked_for is not None:
+                    wait = locked_for
+                    print(f"  429 — locked out for {format_duration(wait)} (Retry-After: {retry_after})")
+                else:
+                    print(f"  429 — rate-limited, no Retry-After given; backing off {format_duration(wait)}")
+            else:
+                print(f"  HTTP {e.code}")
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+            # OSError covers dropped connections, which aren't URLErrors.
+            last_err = e
+            wait = REQUEST_GAP_S * (attempt + 2)
+        if i < len(attempts) - 1:
+            print(f"  retrying in {format_duration(wait)}...")
+            time.sleep(wait)
     raise last_err
 
 
@@ -218,8 +260,14 @@ def main():
     print(f"{len(maps)} maps, {len(pending)} to fetch")
 
     failures = 0
+    durations = []
     for i, (key, points, profile_name) in enumerate(pending):
-        print(f"{key} ({profile_name}): querying Overpass…")
+        eta = ""
+        if durations:
+            avg = sum(durations) / len(durations)
+            eta = f", ~{format_duration(avg * (len(pending) - i))} left"
+        print(f"[{i + 1}/{len(pending)}] {key} ({profile_name}): querying Overpass…{eta}")
+        t0 = time.monotonic()
         try:
             out[key] = fetch_for_profile(points, profile_name)
             print(f"  {len(out[key])} ways")
@@ -227,11 +275,14 @@ def main():
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
             failures += 1
             print(f"  FAILED: {e} — leaving this cluster without streets")
+        durations.append(time.monotonic() - t0)
         if i < len(pending) - 1:
             time.sleep(REQUEST_GAP_S)
 
     if out:
         print(f"{OUT.name}: {len(out)} maps, {sum(len(v) for v in out.values())} ways total")
+    if durations:
+        print(f"took {format_duration(sum(durations) + REQUEST_GAP_S * max(len(durations) - 1, 0))}")
     # A partial fetch is worth keeping, but the workflow should not publish it as if it
     # were complete.
     if failures:

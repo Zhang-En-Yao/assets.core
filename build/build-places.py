@@ -36,7 +36,8 @@ OUT = REPO / "places.json"
 
 SPARQL = "https://query.wikidata.org/sparql"
 AGENT = "zhang-en-yao.github.io places builder (build-places.py)"
-GAP_S = 0.15
+GAP_S = 2.0
+BATCH_SIZE = 30
 
 # Claims the fact card shows. Everything Wikidata has is written out; how many of them a
 # card prints is the page's business, not this script's.
@@ -56,7 +57,7 @@ def get(url):
         except urllib.error.HTTPError as error:
             if error.code != 429 or attempt == 7:
                 raise
-            wait = max(65, int(error.headers.get("Retry-After", 0)))
+            wait = max(90, int(error.headers.get("Retry-After", 0)))
             print(f"  rate-limited, waiting {wait}s", file=sys.stderr)
             time.sleep(wait)
         except OSError as error:
@@ -71,38 +72,50 @@ def sparql(query):
     return get(f"{SPARQL}?format=json&query={urllib.parse.quote(query)}")["results"]["bindings"]
 
 
-def pull(qids, prop):
-    """{item QID: [{id, label}]} for one claim, in Wikidata's own English labels."""
-    out = {}
-    for i in range(0, len(qids), 120):
-        values = " ".join("wd:" + q for q in qids[i:i + 120])
-        rows = sparql(f"""SELECT ?item ?v ?en WHERE {{ VALUES ?item {{ {values} }}
-          ?item wdt:{prop} ?v .
+def pull(qids, props):
+    """{key: {item QID: [{id, label}]}} for a set of claims, in Wikidata's own English labels."""
+    out = {key: {} for key, _ in props}
+    for i in range(0, len(qids), BATCH_SIZE):
+        values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
+        clauses = "\nUNION\n".join(
+            f"""{{ ?item wdt:{prop} ?v . BIND({json.dumps(key)} AS ?kind) }}"""
+            for key, prop in props
+        )
+        rows = sparql(f"""SELECT ?item ?v ?kind ?en WHERE {{ VALUES ?item {{ {values} }}
+          {clauses}
           OPTIONAL {{ ?v rdfs:label ?en FILTER(LANG(?en) = "en") }} }}""")
         for row in rows:
             item = row["item"]["value"].rsplit("/", 1)[-1]
             value = row["v"]["value"].rsplit("/", 1)[-1]
             label = row.get("en", {}).get("value")
-            seen = out.setdefault(item, {})
+            seen = out[row["kind"]["value"]].setdefault(item, {})
             if label and value not in seen:
                 seen[value] = label
-    return {q: [{"id": k, "label": v} for k, v in labels.items()] for q, labels in out.items()}
+    return {key: {q: [{"id": k, "label": v} for k, v in labels.items()] for q, labels in items.items()}
+            for key, items in out.items()}
 
 
-def pull_dates(qids, prop):
-    out = {}
-    for i in range(0, len(qids), 200):
-        values = " ".join("wd:" + q for q in qids[i:i + 200])
-        rows = sparql(f"SELECT ?item ?v WHERE {{ VALUES ?item {{ {values} }} ?item wdt:{prop} ?v . }}")
+def pull_dates(qids, props):
+    """{key: {item QID: [year, ...]}} for a set of date claims."""
+    out = {key: {} for key, _ in props}
+    for i in range(0, len(qids), BATCH_SIZE):
+        values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
+        clauses = "\nUNION\n".join(
+            f"""{{ ?item wdt:{prop} ?v . BIND({json.dumps(key)} AS ?kind) }}"""
+            for key, prop in props
+        )
+        rows = sparql(f"""SELECT ?item ?v ?kind WHERE {{ VALUES ?item {{ {values} }}
+          {clauses} }}""")
         for row in rows:
             stamp = row["v"]["value"]
             if not re.match(r"^-?\d{3,4}-\d{2}-\d{2}T", stamp):
                 continue  # "unknown value" nodes come back as a hash
             sign, digits = ("-", stamp[1:]) if stamp[0] == "-" else ("", stamp)
             year = sign + str(int(digits.split("-")[0]))
-            out.setdefault(row["item"]["value"].rsplit("/", 1)[-1], [])
-            if year not in out[row["item"]["value"].rsplit("/", 1)[-1]]:
-                out[row["item"]["value"].rsplit("/", 1)[-1]].append(year)
+            item = row["item"]["value"].rsplit("/", 1)[-1]
+            years = out[row["kind"]["value"]].setdefault(item, [])
+            if year not in years:
+                years.append(year)
     return out
 
 
@@ -138,8 +151,8 @@ def main():
 
     places = {q: {} for q in qids}
     rows = []
-    for i in range(0, len(qids), 120):
-        values = " ".join("wd:" + q for q in qids[i:i + 120])
+    for i in range(0, len(qids), BATCH_SIZE):
+        values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
         rows += sparql(f"""SELECT ?item ?c ?label ?description WHERE {{ VALUES ?item {{ {values} }}
           OPTIONAL {{ ?item wdt:P625 ?c }}
           OPTIONAL {{ ?item rdfs:label ?label FILTER(LANG(?label) = "en") }}
@@ -157,28 +170,31 @@ def main():
     # "part of a World Heritage Site" and "World Heritage Site" say nothing the
     # heritageSite link below does not say better.
     skip = {"Q43113623", "Q9259"}
-    for key, prop in CLAIMS:
-        for qid, values in pull(qids, prop).items():
+    pulled = pull(qids, CLAIMS)
+    for key, _ in CLAIMS:
+        for qid, values in pulled[key].items():
             values = [v for v in values if v["id"] not in skip]
             if values:
                 places[qid][key] = values
         print(f"  {key}: {sum(1 for p in places.values() if key in p)}")
-    for key, prop in DATES:
-        for qid, years in pull_dates(qids, prop).items():
+    pulled_dates = pull_dates(qids, DATES)
+    for key, _ in DATES:
+        for qid, years in pulled_dates[key].items():
             places[qid][key] = years
 
     for lang in ("en",):
-        values = " ".join("wd:" + q for q in qids)
-        for row in sparql(f"""SELECT ?item ?site WHERE {{ VALUES ?item {{ {values} }}
-          ?site schema:about ?item ; schema:isPartOf <https://{lang}.wikipedia.org/> . }}"""):
-            title = row["site"]["value"].split("/wiki/", 1)[-1]
-            places[row["item"]["value"].rsplit("/", 1)[-1]]["wikipedia"] = \
-                urllib.parse.unquote(title).replace("_", " ")
+        for i in range(0, len(qids), BATCH_SIZE):
+            values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
+            for row in sparql(f"""SELECT ?item ?site WHERE {{ VALUES ?item {{ {values} }}
+              ?site schema:about ?item ; schema:isPartOf <https://{lang}.wikipedia.org/> . }}"""):
+                title = row["site"]["value"].split("/wiki/", 1)[-1]
+                places[row["item"]["value"].rsplit("/", 1)[-1]]["wikipedia"] = \
+                    urllib.parse.unquote(title).replace("_", " ")
 
     # World Heritage: the item's own listing, or the one it is a part of.
     listings, sites = {}, {}
-    for i in range(0, len(qids), 150):
-        values = " ".join("wd:" + q for q in qids[i:i + 150])
+    for i in range(0, len(qids), BATCH_SIZE):
+        values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
         for row in sparql(f"""SELECT ?item ?whs ?id WHERE {{ VALUES ?item {{ {values} }}
           {{ ?item wdt:P757 ?id . BIND(?item AS ?whs) }} UNION {{ ?item wdt:P361 ?whs . ?whs wdt:P757 ?id }}
           UNION {{ ?item wdt:P361/wdt:P361 ?whs . ?whs wdt:P757 ?id }} }}"""):
