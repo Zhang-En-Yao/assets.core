@@ -121,8 +121,16 @@ def gaps(points, places):
     return out
 
 
+def summarise(markdown):
+    """Append to the workflow's summary page, when there is one."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(markdown)
+
+
 def report(sections):
-    """Print the gaps, and put them on the workflow's summary page when there is one."""
+    """Print the gaps, and put them on the summary page."""
     if not sections:
         print("\nno gaps")
         return
@@ -130,15 +138,25 @@ def report(sections):
         print(f"\n{heading}")
         for item in items:
             print("   " + item.replace("`", "").replace("**", ""))
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as f:
-            f.write("## Gaps\n\n")
-            for heading, items in sections:
-                f.write(f"### {heading}\n\n")
-                for item in items:
-                    f.write(f"- {item}\n")
-                f.write("\n")
+    out = ["## Gaps\n\n"]
+    for heading, items in sections:
+        out.append(f"### {heading}\n\n")
+        out += [f"- {item}\n" for item in items]
+        out.append("\n")
+    summarise("".join(out))
+
+
+def report_failures():
+    """The failures go on the summary page too.
+
+    Without this the summary of a failed run showed only the gaps — which are the things
+    that are *not* errors — so the page read as if a red run had two small omissions, and
+    the actual reason sat in the log where nobody was looking. What stopped the build
+    belongs at the top of the page, above what merely needs attention.
+    """
+    summarise("## Failed\n\n" + "".join(f"- {p}\n" for p in problems)
+              + "\nNothing was published. Fix these, or run the Data workflow if the file"
+                " that is missing is one the build writes.\n\n")
 
 
 def main():
@@ -216,8 +234,11 @@ def main():
         size = f"{path.stat().st_size / 1024:6.0f} KB" if path.exists() else "  missing"
         print(f"{mark} {name:16} {count:>6} rows  {size}")
 
-    # The gaps print whether or not anything failed: a run that stops is exactly when
-    # you want to see the whole picture.
+    # Failures first, then the gaps — both on the summary page, whether or not anything
+    # failed. A run that stops is exactly when you want to see the whole picture, and the
+    # reason it stopped should not be the one thing missing from it.
+    if problems:
+        report_failures()
     report(gaps(points, places))
 
     if problems:
