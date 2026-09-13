@@ -1,0 +1,45 @@
+name: Trip check
+
+# Called by every assets.trip.* repository on push. Validation only: validate-trip.py
+# reaches no network, so unlike the build in trip-data.yml there is no public service to
+# be considerate of, and no reason for a push not to be checked.
+#
+# It writes nothing and publishes nothing. Rebuilding and tagging stay in trip-data.yml,
+# on request, because those are decisions.
+#
+#   # assets.trip.<id>/.github/workflows/check.yml
+#   name: Check
+#   on: [push, pull_request]
+#   jobs:
+#     check:
+#       uses: Zhang-En-Yao/assets.core/.github/workflows/trip-check.yml@main
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the trip
+        uses: actions/checkout@v4
+
+      - name: Check out the build scripts
+        uses: actions/checkout@v4
+        with:
+          repository: Zhang-En-Yao/assets.core
+          path: .core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # --check leaves MANIFEST.json alone: this job is a reader. The gaps it finds — points
+      # with no wikidata key, points Wikidata has no coordinate for, coordinates that
+      # disagree — go to the run summary without failing, so they are visible on every push
+      # instead of only when someone goes looking.
+      - name: Validate
+        run: python3 .core/build/validate-trip.py --check

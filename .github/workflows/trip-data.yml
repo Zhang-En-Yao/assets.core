@@ -2,6 +2,10 @@ name: Trip data
 
 # Called by every assets.trip.* repository, so the build scripts exist once, here.
 #
+# On request only. It fetches from Wikidata and Overpass, which are shared public
+# services, and it publishes a tag — neither belongs on a push. Push runs
+# trip-check.yml instead, which validates and touches nothing.
+#
 #   # assets.trip.<id>/.github/workflows/data.yml
 #   name: Data
 #   on:
