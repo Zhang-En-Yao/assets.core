@@ -48,6 +48,27 @@ CLAIMS = [
 DATES = [("inception", "P571"), ("opened", "P1619"), ("ended", "P576")]
 
 
+def format_duration(seconds):
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def countdown_sleep(seconds, label):
+    """Prints remaining time every 10s, so a long wait doesn't look like a hang."""
+    remaining = seconds
+    while remaining > 0:
+        print(f"  {label}: {format_duration(remaining)} left", file=sys.stderr)
+        step = min(10, remaining)
+        time.sleep(step)
+        remaining -= step
+
+
 def get(url):
     request = urllib.request.Request(url, headers={"User-Agent": AGENT, "Accept": "application/json"})
     for attempt in range(8):
@@ -58,13 +79,13 @@ def get(url):
             if error.code != 429 or attempt == 7:
                 raise
             wait = max(90, int(error.headers.get("Retry-After", 0)))
-            print(f"  rate-limited, waiting {wait}s", file=sys.stderr)
-            time.sleep(wait)
+            countdown_sleep(wait, "429 — locked out")
         except OSError as error:
             if attempt == 7:
                 raise
-            print(f"  retrying ({error})", file=sys.stderr)
-            time.sleep(2 * (attempt + 1))
+            wait = 2 * (attempt + 1)
+            print(f"  retrying in {format_duration(wait)} ({error})", file=sys.stderr)
+            time.sleep(wait)
 
 
 def sparql(query):
