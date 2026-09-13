@@ -49,19 +49,27 @@ jobs:
       - name: Validate
         run: python3 build/validate.py
 
-      - name: Commit and tag
+      - name: Publish
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tag="$(date -u +%Y-%m-%d)"
+
           if git diff --quiet; then
-            echo "nothing changed"
+            echo "The build produced no change." >> "$GITHUB_STEP_SUMMARY"
+          else
+            git add -A
+            git commit -m "Rebuild core data ($tag)"
+          fi
+
+          # Tag whatever is current, changed or not — see trip-data.yml for why.
+          if [ "$(git rev-parse -q --verify "refs/tags/$tag^{commit}")" = "$(git rev-parse HEAD)" ]; then
+            echo "Already published as \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          tag="$(date -u +%Y-%m-%d)"
-          git add -A
-          git commit -m "Rebuild core data ($tag)"
-          git tag -f "$tag"
-          git push origin HEAD --follow-tags --force-with-lease
+          git tag -f -a "$tag" -m "$tag"
+          git push origin HEAD --force-with-lease
+          git push -f origin "refs/tags/$tag"
           {
             echo "### Published \`$tag\`"
             echo
