@@ -62,14 +62,21 @@ jobs:
             git commit -m "Rebuild core data ($tag)"
           fi
 
-          # Tag whatever is current, changed or not — see trip-data.yml for why.
-          if [ "$(git rev-parse -q --verify "refs/tags/$tag^{commit}")" = "$(git rev-parse HEAD)" ]; then
-            echo "Already published as \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          git tag -f -a "$tag" -m "$tag"
+          # A tag is never moved, only added to — see trip-data.yml for why.
+          git fetch --tags --force --quiet
+          base="$tag"; n=1
+          while git rev-parse -q --verify "refs/tags/$tag" >/dev/null; do
+            if [ "$(git rev-parse "refs/tags/$tag^{commit}")" = "$(git rev-parse HEAD)" ]; then
+              echo "Already published as \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            n=$((n + 1)); tag="$base.$n"
+          done
+          git tag -a "$tag" -m "$tag"
           git push origin HEAD --force-with-lease
-          git push -f origin "refs/tags/$tag"
+          # Pushed by name: --follow-tags ignores lightweight tags, which is how a tag can
+          # look created here and not exist on the remote.
+          git push origin "refs/tags/$tag"
           {
             echo "### Published \`$tag\`"
             echo

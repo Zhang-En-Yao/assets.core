@@ -86,18 +86,24 @@ jobs:
             git commit -m "Rebuild trip data ($tag)"
           fi
 
-          # Tag whatever is current, changed or not. The tag is how the site pins this
-          # repository, so a first publish of data that was already correct still needs
-          # one — "nothing changed" is not a reason to leave it unpublishable.
-          if [ "$(git rev-parse -q --verify "refs/tags/$tag^{commit}")" = "$(git rev-parse HEAD)" ]; then
-            echo "Already published as \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          git tag -f -a "$tag" -m "$tag"
+          # jsDelivr caches a tag forever, so a tag that already exists somewhere else is
+          # not a tag to reuse: force-moving it leaves the CDN serving the old bytes with
+          # no error and no way to tell. Take the next free suffix instead — the whole
+          # point of pinning a tag is that it never means two different things.
+          git fetch --tags --force --quiet
+          base="$tag"; n=1
+          while git rev-parse -q --verify "refs/tags/$tag" >/dev/null; do
+            if [ "$(git rev-parse "refs/tags/$tag^{commit}")" = "$(git rev-parse HEAD)" ]; then
+              echo "Already published as \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            n=$((n + 1)); tag="$base.$n"
+          done
+          git tag -a "$tag" -m "$tag"
           git push origin HEAD --force-with-lease
-          # An annotated tag, pushed by name: --follow-tags ignores lightweight tags, which
-          # is how a tag can look created here and not exist on the remote.
-          git push -f origin "refs/tags/$tag"
+          # Pushed by name: --follow-tags ignores lightweight tags, which is how a tag can
+          # look created here and not exist on the remote.
+          git push origin "refs/tags/$tag"
           {
             echo "### Published \`$tag\`"
             echo
