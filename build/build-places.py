@@ -34,10 +34,18 @@ REPO = pathlib.Path.cwd()
 CONTENT = REPO / "content.json"
 OUT = REPO / "places.json"
 
-SPARQL = "https://query.wikidata.org/sparql"
-AGENT = "zhang-en-yao.github.io places builder (build-places.py)"
-GAP_S = 2.0
-BATCH_SIZE = 30
+# Everything here comes from the Action API, not the query service. WDQS throttles hard
+# per IP and a block there lasts for many minutes; api.php is a separate, far more generous
+# limiter, and wbgetentities hands back labels, descriptions, claims and sitelinks for 50
+# entities in a single request — so a whole trip is two calls rather than five SPARQL
+# queries. Nothing below needs to traverse the graph, so nothing below needs SPARQL.
+API = "https://www.wikidata.org/w/api.php"
+# Wikimedia's User-Agent policy asks for a contact; without one, requests look anonymous
+# and are throttled sooner.
+AGENT = ("zhang-en-yao.github.io places builder (build-places.py; "
+         "+https://github.com/Zhang-En-Yao/assets.core)")
+GAP_S = 1.0
+BATCH_SIZE = 50  # wbgetentities' documented ceiling for ids per request.
 # Waiting out one Retry-After should be enough for a short burst. If the very next request
 # gets 429 again, this is a longer block that a fixed wait-and-retry won't fix — fail fast
 # instead of silently grinding through 8 attempts (which could take hours).
@@ -101,56 +109,89 @@ def get(url):
             time.sleep(wait)
 
 
-def sparql(query):
-    time.sleep(GAP_S)
-    return get(f"{SPARQL}?format=json&query={urllib.parse.quote(query)}")["results"]["bindings"]
-
-
-def pull(qids, props):
-    """{key: {item QID: [{id, label}]}} for a set of claims, in Wikidata's own English labels."""
-    out = {key: {} for key, _ in props}
+def entities(qids, props, **extra):
+    """{QID: entity} from wbgetentities, in batches, for whichever props are asked for."""
+    out = {}
     for i in range(0, len(qids), BATCH_SIZE):
-        values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
-        clauses = "\nUNION\n".join(
-            f"""{{ ?item wdt:{prop} ?v . BIND({json.dumps(key)} AS ?kind) }}"""
-            for key, prop in props
-        )
-        rows = sparql(f"""SELECT ?item ?v ?kind ?en WHERE {{ VALUES ?item {{ {values} }}
-          {clauses}
-          OPTIONAL {{ ?v rdfs:label ?en FILTER(LANG(?en) = "en") }} }}""")
-        for row in rows:
-            item = row["item"]["value"].rsplit("/", 1)[-1]
-            value = row["v"]["value"].rsplit("/", 1)[-1]
-            label = row.get("en", {}).get("value")
-            seen = out[row["kind"]["value"]].setdefault(item, {})
-            if label and value not in seen:
-                seen[value] = label
-    return {key: {q: [{"id": k, "label": v} for k, v in labels.items()] for q, labels in items.items()}
-            for key, items in out.items()}
-
-
-def pull_dates(qids, props):
-    """{key: {item QID: [year, ...]}} for a set of date claims."""
-    out = {key: {} for key, _ in props}
-    for i in range(0, len(qids), BATCH_SIZE):
-        values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
-        clauses = "\nUNION\n".join(
-            f"""{{ ?item wdt:{prop} ?v . BIND({json.dumps(key)} AS ?kind) }}"""
-            for key, prop in props
-        )
-        rows = sparql(f"""SELECT ?item ?v ?kind WHERE {{ VALUES ?item {{ {values} }}
-          {clauses} }}""")
-        for row in rows:
-            stamp = row["v"]["value"]
-            if not re.match(r"^-?\d{3,4}-\d{2}-\d{2}T", stamp):
-                continue  # "unknown value" nodes come back as a hash
-            sign, digits = ("-", stamp[1:]) if stamp[0] == "-" else ("", stamp)
-            year = sign + str(int(digits.split("-")[0]))
-            item = row["item"]["value"].rsplit("/", 1)[-1]
-            years = out[row["kind"]["value"]].setdefault(item, [])
-            if year not in years:
-                years.append(year)
+        query = dict(action="wbgetentities", format="json", formatversion="2",
+                     ids="|".join(qids[i:i + BATCH_SIZE]), props=props,
+                     languages="en", **extra)
+        time.sleep(GAP_S)
+        payload = get(f"{API}?{urllib.parse.urlencode(query)}")
+        # One unusable id fails the whole batch, so say which and what was wrong with it
+        # rather than letting every entity in the batch look like it came back empty.
+        if "error" in payload:
+            error = payload["error"]
+            raise SystemExit(f"Wikidata rejected a request for "
+                             f"{', '.join(qids[i:i + BATCH_SIZE])}: "
+                             f"{error.get('code')} — {error.get('info')}")
+        out.update(payload.get("entities", {}))
     return out
+
+
+def best(entity, prop):
+    """The statements wdt: would have returned: preferred rank if any, never deprecated."""
+    claims = [c for c in entity.get("claims", {}).get(prop, [])
+              if c.get("rank") != "deprecated" and c.get("mainsnak", {}).get("snaktype") == "value"]
+    preferred = [c for c in claims if c.get("rank") == "preferred"]
+    return preferred or claims
+
+
+def values(entity, prop):
+    """The QIDs a wikibase-item claim points at, in order, deduplicated."""
+    out = []
+    for claim in best(entity, prop):
+        value = claim["mainsnak"]["datavalue"]["value"]
+        if isinstance(value, dict) and value.get("id") and value["id"] not in out:
+            out.append(value["id"])
+    return out
+
+
+def year_of(stamp):
+    """Wikidata's +1865-01-01T00:00:00Z as a plain year, or None for an unknown-value node."""
+    if not re.match(r"^[+-]?\d{3,4}-\d{2}-\d{2}T", stamp):
+        return None
+    sign, digits = ("-", stamp[1:]) if stamp[0] == "-" else ("", stamp.lstrip("+"))
+    return sign + str(int(digits.split("-")[0]))
+
+def heritage_listing(qids, fetched):
+    """Each item's World Heritage listing: its own, or the one it is (a part of a) part of.
+
+    SPARQL would walk this with a property path; two more wbgetentities calls do the same
+    two hops, and only for the items that actually claim to be part of something.
+    """
+    listings, known = {}, dict(fetched)
+    frontier = {q: [q] for q in qids}
+    for level in range(3):  # the item itself, then two levels of P361, as the old query did.
+        for qid, nodes in frontier.items():
+            for node in nodes:
+                reference = best(known.get(node, {}), "P757")
+                if reference:
+                    listings[qid] = {"id": node,
+                                     "ref": reference[0]["mainsnak"]["datavalue"]["value"]}
+                    break
+        if level == 2:
+            break  # the next level's parents would be fetched and never looked at.
+        climb = {}
+        for qid, nodes in frontier.items():
+            if qid in listings:
+                continue
+            # Every P361 parent, not just the first: an item can be part of a city *and*
+            # of the heritage site, and the site is not always the first statement.
+            parents = []
+            for node in nodes:
+                for parent in values(known.get(node, {}), "P361"):
+                    if parent not in parents:
+                        parents.append(parent)
+            if parents:
+                climb[qid] = parents
+        frontier = climb
+        if not frontier:
+            break
+        missing = sorted({p for ps in frontier.values() for p in ps} - set(known))
+        if missing:
+            known.update(entities(missing, "claims"))
+    return listings
 
 
 def load_points(content):
@@ -182,74 +223,87 @@ def main():
     if not qids:
         raise SystemExit("no linked points — nothing to fetch")
     print(f"{len(qids)} entities")
+    # One request per 50 entities brings back everything below except the labels of the
+    # QIDs the claims point at, which is one more request for all of them together.
+    fetched = entities(qids, "labels|descriptions|claims|sitelinks", sitefilter="enwiki")
+    # An id that no longer resolves is an editorial problem, not a fetching one: the item
+    # was deleted or merged away under you. Name it and stop, rather than quietly writing
+    # an empty record that only shows up later as a point with no coordinate.
+    gone = [q for q in qids if q not in fetched or "missing" in fetched[q]]
+    if gone:
+        raise SystemExit(
+            "Wikidata has no item for " + ", ".join(gone) + ".\n"
+            "Deleted, or merged into another item. Look each one up and put the id it "
+            "redirects to in content.json — which entity a place is stays your call.")
 
     places = {q: {} for q in qids}
-    rows = []
-    for i in range(0, len(qids), BATCH_SIZE):
-        values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
-        rows += sparql(f"""SELECT ?item ?c ?label ?description WHERE {{ VALUES ?item {{ {values} }}
-          OPTIONAL {{ ?item wdt:P625 ?c }}
-          OPTIONAL {{ ?item rdfs:label ?label FILTER(LANG(?label) = "en") }}
-          OPTIONAL {{ ?item schema:description ?description FILTER(LANG(?description) = "en") }} }}""")
-    for row in rows:
-        place = places[row["item"]["value"].rsplit("/", 1)[-1]]
-        if "c" in row and "coord" not in place:
-            m = re.search(r"Point\(([-\d.]+) ([-\d.]+)\)", row["c"]["value"])
-            if m:
-                place["coord"] = [round(float(m.group(2)), 6), round(float(m.group(1)), 6)]
-        for key in ("label", "description"):
-            if key in row and key not in place:
-                place[key] = row[key]["value"]
+    for qid, entity in fetched.items():
+        place = places[qid]
+        label = entity.get("labels", {}).get("en", {}).get("value")
+        description = entity.get("descriptions", {}).get("en", {}).get("value")
+        if label:
+            place["label"] = label
+        if description:
+            place["description"] = description
+        coord = best(entity, "P625")
+        if coord:
+            value = coord[0]["mainsnak"]["datavalue"]["value"]
+            place["coord"] = [round(value["latitude"], 6), round(value["longitude"], 6)]
+        title = entity.get("sitelinks", {}).get("enwiki", {}).get("title")
+        if title:
+            place["wikipedia"] = title
 
     # "part of a World Heritage Site" and "World Heritage Site" say nothing the
     # heritageSite link below does not say better.
     skip = {"Q43113623", "Q9259"}
-    pulled = pull(qids, CLAIMS)
-    for key, _ in CLAIMS:
-        for qid, values in pulled[key].items():
-            values = [v for v in values if v["id"] not in skip]
-            if values:
-                places[qid][key] = values
-        print(f"  {key}: {sum(1 for p in places.values() if key in p)}")
-    pulled_dates = pull_dates(qids, DATES)
-    for key, _ in DATES:
-        for qid, years in pulled_dates[key].items():
-            places[qid][key] = years
-
-    for lang in ("en",):
-        for i in range(0, len(qids), BATCH_SIZE):
-            values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
-            for row in sparql(f"""SELECT ?item ?site WHERE {{ VALUES ?item {{ {values} }}
-              ?site schema:about ?item ; schema:isPartOf <https://{lang}.wikipedia.org/> . }}"""):
-                title = row["site"]["value"].split("/wiki/", 1)[-1]
-                places[row["item"]["value"].rsplit("/", 1)[-1]]["wikipedia"] = \
-                    urllib.parse.unquote(title).replace("_", " ")
-
-    # World Heritage: the item's own listing, or the one it is a part of.
-    listings, sites = {}, {}
-    for i in range(0, len(qids), BATCH_SIZE):
-        values = " ".join("wd:" + q for q in qids[i:i + BATCH_SIZE])
-        for row in sparql(f"""SELECT ?item ?whs ?id WHERE {{ VALUES ?item {{ {values} }}
-          {{ ?item wdt:P757 ?id . BIND(?item AS ?whs) }} UNION {{ ?item wdt:P361 ?whs . ?whs wdt:P757 ?id }}
-          UNION {{ ?item wdt:P361/wdt:P361 ?whs . ?whs wdt:P757 ?id }} }}"""):
-            qid = row["item"]["value"].rsplit("/", 1)[-1]
-            listings[qid] = {"id": row["whs"]["value"].rsplit("/", 1)[-1], "ref": row["id"]["value"]}
+    listings = heritage_listing(qids, fetched)
     for qid, listing in listings.items():
         places[qid]["heritageSite"] = listing
-    if listings:
-        values = " ".join("wd:" + w["id"] for w in listings.values())
-        for row in sparql(f"""SELECT ?whs ?label ?crit ?critLabel ?year WHERE {{ VALUES ?whs {{ {values} }}
-          OPTIONAL {{ ?whs rdfs:label ?label FILTER(LANG(?label) = "en") }}
-          OPTIONAL {{ ?whs wdt:P2614 ?crit }}
-          OPTIONAL {{ ?whs p:P1435 [ ps:P1435 wd:Q9259 ; pq:P580 ?year ] }}
-          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" }} }}"""):
-            site = sites.setdefault(row["whs"]["value"].rsplit("/", 1)[-1], {"criteria": []})
-            if "label" in row and "label" not in site:
-                site["label"] = row["label"]["value"]
-            if "year" in row:
-                site["inscribed"] = row["year"]["value"][:4]
-            if "critLabel" in row and row["critLabel"]["value"] not in site["criteria"]:
-                site["criteria"].append(row["critLabel"]["value"])
+
+    sites = {}
+    site_entities = entities(sorted({w["id"] for w in listings.values()}),
+                             "labels|claims") if listings else {}
+    for qid, entity in site_entities.items():
+        site = sites.setdefault(qid, {"criteria": []})
+        label = entity.get("labels", {}).get("en", {}).get("value")
+        if label:
+            site["label"] = label
+        for claim in best(entity, "P1435"):
+            if claim["mainsnak"]["datavalue"]["value"].get("id") != "Q9259":
+                continue
+            for qualifier in claim.get("qualifiers", {}).get("P580", []):
+                if qualifier.get("snaktype") == "value":
+                    year = year_of(qualifier["datavalue"]["value"]["time"])
+                    if year:
+                        site["inscribed"] = year
+
+    # Everything the cards print by name — claim values and heritage criteria — arrives as
+    # bare QIDs, so resolve the whole lot in one pass rather than per property.
+    wanted = {qid: {key: [v for v in values(fetched[qid], prop) if v not in skip]
+                    for key, prop in CLAIMS} for qid in qids}
+    criteria = {qid: values(entity, "P2614") for qid, entity in site_entities.items()}
+    needed = sorted({v for bykey in wanted.values() for vs in bykey.values() for v in vs}
+                    | {v for vs in criteria.values() for v in vs})
+    labels = {qid: e.get("labels", {}).get("en", {}).get("value")
+              for qid, e in entities(needed, "labels").items()} if needed else {}
+
+    for key, _ in CLAIMS:
+        for qid in qids:
+            found = [{"id": v, "label": labels[v]} for v in wanted[qid][key] if labels.get(v)]
+            if found:
+                places[qid][key] = found
+        print(f"  {key}: {sum(1 for p in places.values() if key in p)}")
+    for key, prop in DATES:
+        for qid in qids:
+            years = []
+            for claim in best(fetched[qid], prop):
+                year = year_of(claim["mainsnak"]["datavalue"]["value"]["time"])
+                if year and year not in years:
+                    years.append(year)
+            if years:
+                places[qid][key] = years
+    for qid, site in sites.items():
+        site["criteria"] = [labels[v] for v in criteria.get(qid, []) if labels.get(v)]
 
     OUT.write_text(json.dumps({"places": places, "heritageSites": sites},
                               ensure_ascii=False, separators=(",", ":")) + "\n")

@@ -1,0 +1,14 @@
+name: Check
+
+# The build scripts read Wikidata's raw JSON and decide for themselves what a statement
+# means — which rank wins, what counts as a date, how far a part-of chain is followed.
+# Those rules used to belong to the query service; now they belong to this repository, so
+# they get tested here. No network: every fixture is checked in.
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 build/test-build-places.py
